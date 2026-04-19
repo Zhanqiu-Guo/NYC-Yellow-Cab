@@ -39,10 +39,10 @@ EARLY_STOP_VAL_FRAC = 0.10  # internal tail split inside each training window
 
 RAW_X_MEMMAP = os.path.join(DATA_DIR, "X_raw_memmap.dat")
 Y_MEMMAP = os.path.join(DATA_DIR, "Y_memmap.dat")
-SCALER_PATH = os.path.join(DATA_DIR, "xgb_graph_residual_scaler.pkl")
-MODEL_PATH = os.path.join(DATA_DIR, "best_xgb_graph_residual_oof.pth")
-XGB_D_PATH = os.path.join(DATA_DIR, "xgb_demand_full.json")
-XGB_P_PATH = os.path.join(DATA_DIR, "xgb_price_full.json")
+SCALER_PATH = os.path.join(DATA_DIR, "xgb_graph_residual_scaler_h1_fixed.pkl")
+MODEL_PATH = os.path.join(DATA_DIR, "best_xgb_graph_residual_oof_h1_fixed.pth")
+XGB_D_PATH = os.path.join(DATA_DIR, "xgb_demand_full_h1_fixed.json")
+XGB_P_PATH = os.path.join(DATA_DIR, "xgb_price_full_h1_fixed.json")
 
 ID_COLS = {"time_bin", "LocationID", "node_index"}
 TARGET_COLS = ["demand", "revenue_total"]
