@@ -37,12 +37,23 @@ OOF_N_FOLDS = 5
 OOF_MIN_TRAIN_FRAC = 0.40   # first 40% of 2023 only used as initial history for OOF rolling folds
 EARLY_STOP_VAL_FRAC = 0.10  # internal tail split inside each training window
 
+# Test-time feature-noise robustness settings.
+# Each noise std is expressed in units of the feature's training-set std.
+# Example: 0.10 adds N(0, 0.10 * train_std(feature)) to the selected raw feature.
+TRAIN_MODE = False
+RUN_NOISE_ROBUSTNESS = True
+NOISE_GROUPS = ("flights", "demand", "revenue", "weather")
+NOISE_STDS = (0.05, 0.10, 0.20)
+NOISE_REPEATS = 3
+NOISE_SEED = 20260420
+
 RAW_X_MEMMAP = os.path.join(DATA_DIR, "X_raw_memmap.dat")
 Y_MEMMAP = os.path.join(DATA_DIR, "Y_memmap.dat")
 SCALER_PATH = os.path.join(DATA_DIR, "xgb_graph_residual_scaler_h1_fixed.pkl")
 MODEL_PATH = os.path.join(DATA_DIR, "best_xgb_graph_residual_oof_h1_fixed.pth")
 XGB_D_PATH = os.path.join(DATA_DIR, "xgb_demand_full_h1_fixed.json")
 XGB_P_PATH = os.path.join(DATA_DIR, "xgb_price_full_h1_fixed.json")
+NOISE_RESULTS_PATH = os.path.join(DATA_DIR, "noise_robustness_h1_fixed.csv")
 
 ID_COLS = {"time_bin", "LocationID", "node_index"}
 TARGET_COLS = ["demand", "revenue_total"]
@@ -199,15 +210,30 @@ def regression_metrics(y_true, y_pred):
     return mae, rmse, mape, wape
 
 
-def print_metrics(title, d_true, d_pred, r_true, r_pred):
+def metrics_dict(d_true, d_pred, r_true, r_pred):
     d_mae, d_rmse, d_mape, d_wape = regression_metrics(d_true, d_pred)
     r_mae, r_rmse, r_mape, r_wape = regression_metrics(r_true, r_pred)
+    return {
+        "d_mae": d_mae,
+        "d_rmse": d_rmse,
+        "d_mape": d_mape,
+        "d_wape": d_wape,
+        "r_mae": r_mae,
+        "r_rmse": r_rmse,
+        "r_mape": r_mape,
+        "r_wape": r_wape,
+    }
+
+
+def print_metrics(title, d_true, d_pred, r_true, r_pred):
+    m = metrics_dict(d_true, d_pred, r_true, r_pred)
     print("\n" + "=" * 70)
     print(title)
     print("=" * 70)
-    print(f"[Demand ] MAE={d_mae:.3f} RMSE={d_rmse:.3f} MAPE={d_mape:.2f}% WAPE={d_wape:.2f}%")
-    print(f"[Revenue] MAE={r_mae:.3f} RMSE={r_rmse:.3f} MAPE={r_mape:.2f}% WAPE={r_wape:.2f}%")
+    print(f"[Demand ] MAE={m['d_mae']:.3f} RMSE={m['d_rmse']:.3f} MAPE={m['d_mape']:.2f}% WAPE={m['d_wape']:.2f}%")
+    print(f"[Revenue] MAE={m['r_mae']:.3f} RMSE={m['r_rmse']:.3f} MAPE={m['r_mape']:.2f}% WAPE={m['r_wape']:.2f}%")
     print("=" * 70)
+    return m
 
 
 # ============================================================
@@ -331,6 +357,7 @@ def make_time_based_oof_predictions(X_mm, Y_mm, train_t, n_folds=OOF_N_FOLDS, mi
 
 
 def eval_xgb_base(base_preds, Y_mm, sample_t, split_name):
+    m = xgb_base_metrics(base_preds, Y_mm, sample_t)
     ys = (int(sample_t[0]) + 1) * NUM_NODES
     ye = (int(sample_t[-1]) + 2) * NUM_NODES
     Y = Y_mm[ys:ye].reshape(len(sample_t), NUM_NODES, 2)
@@ -342,17 +369,45 @@ def eval_xgb_base(base_preds, Y_mm, sample_t, split_name):
     r_pred = d_pred * p_pred
 
     print_metrics(f"XGBoost BASE | {split_name}", d_true, d_pred, r_true, r_pred)
+    return m
+
+
+def xgb_base_metrics(base_preds, Y_mm, sample_t):
+    ys = (int(sample_t[0]) + 1) * NUM_NODES
+    ye = (int(sample_t[-1]) + 2) * NUM_NODES
+    Y = Y_mm[ys:ye].reshape(len(sample_t), NUM_NODES, 2)
+
+    d_true = Y[..., 0].reshape(-1)
+    r_true = Y[..., 1].reshape(-1)
+    d_pred = np.expm1(base_preds[..., 0]).reshape(-1)
+    p_pred = np.expm1(base_preds[..., 1]).reshape(-1)
+    r_pred = d_pred * p_pred
+
+    return metrics_dict(d_true, d_pred, r_true, r_pred)
 
 
 # ============================================================
 # RESIDUAL DATASET
 # ============================================================
 class ResidualSnapshotDataset(Dataset):
-    def __init__(self, X_mm, Y_mm, sample_t, base_preds, feature_cols, scaler, local_cols, global_cols, static_cols):
+    def __init__(
+        self,
+        X_mm,
+        Y_mm,
+        sample_t,
+        base_preds,
+        feature_cols,
+        scaler,
+        local_cols,
+        global_cols,
+        static_cols,
+        X_override=None,
+    ):
         self.X_mm = X_mm
         self.Y_mm = Y_mm
         self.sample_t = sample_t
         self.base_preds = base_preds
+        self.X_override = X_override
         self.mean_ = scaler.mean_.astype(np.float32)
         self.scale_ = np.where(scaler.scale_ == 0, 1.0, scaler.scale_).astype(np.float32)
 
@@ -360,6 +415,10 @@ class ResidualSnapshotDataset(Dataset):
         self.local_idx = np.array([name_to_idx[c] for c in local_cols], dtype=np.int64)
         self.global_idx = np.array([name_to_idx[c] for c in global_cols], dtype=np.int64)
         self.static_idx = np.array([name_to_idx[c] for c in static_cols], dtype=np.int64)
+
+        if self.X_override is not None:
+            expected = (len(sample_t), NUM_NODES, len(feature_cols))
+            assert self.X_override.shape == expected, f"X_override shape {self.X_override.shape} != {expected}"
 
     def __len__(self):
         return len(self.sample_t)
@@ -369,7 +428,10 @@ class ResidualSnapshotDataset(Dataset):
         x_start = t * NUM_NODES
         y_start = (t + 1) * NUM_NODES
 
-        x = self.X_mm[x_start:x_start + NUM_NODES].copy().reshape(NUM_NODES, -1)
+        if self.X_override is None:
+            x = self.X_mm[x_start:x_start + NUM_NODES].copy().reshape(NUM_NODES, -1)
+        else:
+            x = self.X_override[i].copy()
         x = (x - self.mean_) / self.scale_
         y = self.Y_mm[y_start:y_start + NUM_NODES].copy().reshape(NUM_NODES, 2)
         base = self.base_preds[i]
@@ -527,7 +589,7 @@ def compute_loss(pred_log_d, pred_log_p, d_hat, p_hat, r_hat, d_true, r_true):
 
 
 @torch.no_grad()
-def eval_hybrid(model, loader, A_s, A_f, split_name):
+def eval_hybrid(model, loader, A_s, A_f, split_name, print_result=True, return_metrics=False):
     model.eval()
     losses = []
     d_true_all, d_pred_all = [], []
@@ -555,8 +617,269 @@ def eval_hybrid(model, loader, A_s, A_f, split_name):
     r_true_all = np.concatenate(r_true_all, axis=0).reshape(-1)
     r_pred_all = np.concatenate(r_pred_all, axis=0).reshape(-1)
 
-    print_metrics(f"XGB + GRAPH RESIDUAL (OOF) | {split_name}", d_true_all, d_pred_all, r_true_all, r_pred_all)
-    return float(np.mean(losses))
+    m = metrics_dict(d_true_all, d_pred_all, r_true_all, r_pred_all)
+    if print_result:
+        print_metrics(f"XGB + GRAPH RESIDUAL (OOF) | {split_name}", d_true_all, d_pred_all, r_true_all, r_pred_all)
+
+    loss_value = float(np.mean(losses))
+    if return_metrics:
+        return loss_value, m
+    return loss_value
+
+
+# ============================================================
+# TEST-TIME FEATURE NOISE ROBUSTNESS
+# ============================================================
+def build_noise_feature_groups(feature_cols):
+    groups = {
+        "flights": [],
+        "demand": [],
+        "revenue": [],
+        "weather": [],
+    }
+
+    for c in feature_cols:
+        if (
+            c.startswith(GLOBAL_PREFIXES) or
+            c.startswith("local_airport_") or
+            c.startswith("airport_")
+        ):
+            groups["flights"].append(c)
+
+        if c == "demand" or c.startswith("demand_lag_"):
+            groups["demand"].append(c)
+
+        if (
+            c in {"revenue_total", "revenue_fare", "revenue_tip"} or
+            c.startswith("revenue_lag_") or
+            c.startswith("revenue_total_lag_") or
+            c.startswith("fare_lag_") or
+            c.startswith("tip_lag_")
+        ):
+            groups["revenue"].append(c)
+
+        if (
+            c in {"temperature", "wind_speed", "precipitation"} or
+            c.startswith("temperature_lag_") or
+            c.startswith("temp_lag_") or
+            c.startswith("wind_speed_lag_") or
+            c.startswith("wind_lag_") or
+            c.startswith("precipitation_lag_") or
+            c.startswith("precip_lag_")
+        ):
+            groups["weather"].append(c)
+
+    return groups
+
+
+def get_split_raw_X(X_mm, sample_t, feature_dim):
+    xs, xe, _, _ = rows_for_contiguous_sample_t(sample_t)
+    return np.array(X_mm[xs:xe], dtype=np.float32, copy=True).reshape(len(sample_t), NUM_NODES, feature_dim)
+
+
+def is_nonnegative_feature(col):
+    return (
+        col == "demand" or
+        col.startswith("demand_lag_") or
+        col.startswith("revenue") or
+        col.startswith("fare_lag_") or
+        col.startswith("tip_lag_") or
+        col.startswith(GLOBAL_PREFIXES) or
+        col.startswith("local_airport_") or
+        col.startswith("airport_") or
+        col == "wind_speed" or
+        col.startswith("wind_speed_lag_") or
+        col.startswith("wind_lag_") or
+        col == "precipitation" or
+        col.startswith("precipitation_lag_") or
+        col.startswith("precip_lag_")
+    )
+
+
+def stable_noise_seed(group_name, noise_std, repeat_idx):
+    group_hash = sum((i + 1) * ord(ch) for i, ch in enumerate(group_name))
+    level_hash = int(round(noise_std * 10000))
+    return int((NOISE_SEED + 1000003 * group_hash + 9176 * level_hash + repeat_idx) % (2**32 - 1))
+
+
+def add_feature_noise_inplace(X_raw, feature_cols, scaler, selected_cols, noise_std, seed):
+    if noise_std <= 0.0 or not selected_cols:
+        return
+
+    name_to_idx = {c: i for i, c in enumerate(feature_cols)}
+    selected_idx = np.array([name_to_idx[c] for c in selected_cols], dtype=np.int64)
+    rng = np.random.default_rng(seed)
+
+    scales = np.where(scaler.scale_ == 0, 1.0, scaler.scale_).astype(np.float32)
+    noise_scale = (noise_std * scales[selected_idx]).reshape(1, 1, -1)
+    noise = rng.normal(loc=0.0, scale=noise_scale, size=X_raw[:, :, selected_idx].shape).astype(np.float32)
+    X_raw[:, :, selected_idx] += noise
+
+    nonnegative_idx = [name_to_idx[c] for c in selected_cols if is_nonnegative_feature(c)]
+    if nonnegative_idx:
+        X_raw[:, :, nonnegative_idx] = np.clip(X_raw[:, :, nonnegative_idx], 0.0, None)
+
+
+def predict_base_for_raw_split(model_d, model_p, X_raw):
+    n_samples = X_raw.shape[0]
+    preds = predict_pair(model_d, model_p, X_raw.reshape(n_samples * NUM_NODES, -1))
+    return preds.reshape(n_samples, NUM_NODES, 2)
+
+
+def summarize_metric(values):
+    values = np.asarray(values, dtype=np.float64)
+    valid = values[~np.isnan(values)]
+    if len(valid) == 0:
+        return np.nan, np.nan
+    return float(valid.mean()), float(valid.std(ddof=1)) if len(valid) > 1 else 0.0
+
+
+def summarize_noise_metrics(repeat_metrics, clean_metrics):
+    row = {}
+    for target_prefix in ("d", "r"):
+        for metric_name in ("mae", "rmse", "mape", "wape"):
+            key = f"{target_prefix}_{metric_name}"
+            mean_value, std_value = summarize_metric([m[key] for m in repeat_metrics])
+            row[f"{key}_mean"] = mean_value
+            row[f"{key}_std"] = std_value
+            row[f"{key}_delta"] = mean_value - clean_metrics[key]
+    return row
+
+
+def fmt_noise_metric(row, key, pct=False):
+    suffix = "%" if pct else ""
+    return (
+        f"{row[f'{key}_mean']:.3f}{suffix}±{row[f'{key}_std']:.3f}"
+        f"(Δ{row[f'{key}_delta']:+.3f}{suffix})"
+    )
+
+
+def print_noise_result(row):
+    print(
+        f"{row['model']:>8} {row['group']:>7} std={row['noise_std']:>4.2f} | Demand  "
+        f"MAE {fmt_noise_metric(row, 'd_mae')}  "
+        f"RMSE {fmt_noise_metric(row, 'd_rmse')}  "
+        f"MAPE {fmt_noise_metric(row, 'd_mape', pct=True)}  "
+        f"WAPE {fmt_noise_metric(row, 'd_wape', pct=True)}"
+    )
+    print(
+        f"{'':>8} {'':>7} {'':>8} | Revenue "
+        f"MAE {fmt_noise_metric(row, 'r_mae')}  "
+        f"RMSE {fmt_noise_metric(row, 'r_rmse')}  "
+        f"MAPE {fmt_noise_metric(row, 'r_mape', pct=True)}  "
+        f"WAPE {fmt_noise_metric(row, 'r_wape', pct=True)}"
+    )
+
+
+def run_noise_robustness(
+    model,
+    xgb_d,
+    xgb_p,
+    X_mm,
+    Y_mm,
+    test_t,
+    feature_cols,
+    scaler,
+    local_cols,
+    global_cols,
+    static_cols,
+    A_s,
+    A_f,
+    clean_base_metrics,
+    clean_hybrid_metrics,
+):
+    feature_groups = build_noise_feature_groups(feature_cols)
+    feature_dim = len(feature_cols)
+    rows = []
+
+    print("\n--- Test-time feature noise robustness ---")
+    print("Noise scale: Gaussian N(0, noise_std * training_std(feature)) on raw features")
+    print("Rows are reported for both XGBoost base and XGB + graph residual hybrid.")
+    for group_name in NOISE_GROUPS:
+        cols = feature_groups.get(group_name, [])
+        preview = ", ".join(cols[:8])
+        suffix = " ..." if len(cols) > 8 else ""
+        print(f"Group {group_name:>7}: {len(cols):3d} cols" + (f" [{preview}{suffix}]" if cols else " [SKIPPED: no matching cols]"))
+
+    for group_name in NOISE_GROUPS:
+        selected_cols = feature_groups.get(group_name, [])
+        if not selected_cols:
+            continue
+
+        for noise_std in NOISE_STDS:
+            base_repeat_metrics = []
+            hybrid_repeat_metrics = []
+            hybrid_losses = []
+            for repeat_idx in range(NOISE_REPEATS):
+                X_noisy = get_split_raw_X(X_mm, test_t, feature_dim)
+                seed = stable_noise_seed(group_name, noise_std, repeat_idx)
+                add_feature_noise_inplace(X_noisy, feature_cols, scaler, selected_cols, noise_std, seed)
+
+                noisy_base = predict_base_for_raw_split(xgb_d, xgb_p, X_noisy)
+                base_repeat_metrics.append(xgb_base_metrics(noisy_base, Y_mm, test_t))
+
+                noisy_ds = ResidualSnapshotDataset(
+                    X_mm,
+                    Y_mm,
+                    test_t,
+                    noisy_base,
+                    feature_cols,
+                    scaler,
+                    local_cols,
+                    global_cols,
+                    static_cols,
+                    X_override=X_noisy,
+                )
+                noisy_loader = DataLoader(
+                    noisy_ds,
+                    batch_size=BATCH_SIZE,
+                    shuffle=False,
+                    num_workers=0,
+                    pin_memory=torch.cuda.is_available(),
+                )
+
+                loss, m = eval_hybrid(
+                    model,
+                    noisy_loader,
+                    A_s,
+                    A_f,
+                    f"TEST NOISE {group_name} std={noise_std:.2f} rep={repeat_idx + 1}",
+                    print_result=False,
+                    return_metrics=True,
+                )
+                hybrid_losses.append(loss)
+                hybrid_repeat_metrics.append(m)
+
+            base_row = {
+                "model": "xgb_base",
+                "group": group_name,
+                "noise_std": noise_std,
+                "repeats": NOISE_REPEATS,
+                "num_features": len(selected_cols),
+                "loss_mean": np.nan,
+                "loss_std": np.nan,
+            }
+            base_row.update(summarize_noise_metrics(base_repeat_metrics, clean_base_metrics))
+            rows.append(base_row)
+            print_noise_result(base_row)
+
+            loss_mean, loss_std = summarize_metric(hybrid_losses)
+            hybrid_row = {
+                "model": "hybrid",
+                "group": group_name,
+                "noise_std": noise_std,
+                "repeats": NOISE_REPEATS,
+                "num_features": len(selected_cols),
+                "loss_mean": loss_mean,
+                "loss_std": loss_std,
+            }
+            hybrid_row.update(summarize_noise_metrics(hybrid_repeat_metrics, clean_hybrid_metrics))
+            rows.append(hybrid_row)
+            print_noise_result(hybrid_row)
+
+    if rows:
+        pd.DataFrame(rows).to_csv(NOISE_RESULTS_PATH, index=False)
+        print(f"Noise robustness results saved to: {NOISE_RESULTS_PATH}")
 
 
 # ============================================================
@@ -575,13 +898,63 @@ def main():
         print("Loading full XGBoost base models...")
         xgb_d = xgb.Booster(); xgb_d.load_model(XGB_D_PATH)
         xgb_p = xgb.Booster(); xgb_p.load_model(XGB_P_PATH)
-    else:
+    elif TRAIN_MODE:
         xgb_d, xgb_p = train_full_xgb_base(X_mm, Y_mm, train_t)
+    else:
+        raise FileNotFoundError(
+            f"Missing XGBoost base models: {XGB_D_PATH}, {XGB_P_PATH}. "
+            "Set TRAIN_MODE=True to train them, or run from a directory where the saved models exist."
+        )
+
+    base_test = predict_base_for_contiguous_split(xgb_d, xgb_p, X_mm, test_t)
+    clean_base_metrics = eval_xgb_base(base_test, Y_mm, test_t, "TEST")
+
+    A_s, A_f = load_graphs()
+    model = XGBGraphResidualNet(
+        num_nodes=NUM_NODES,
+        local_dim=len(local_cols),
+        global_dim=len(global_cols),
+        static_dim=len(static_cols),
+        hidden_dim=HIDDEN,
+        depth=DEPTH,
+    ).to(DEVICE)
+
+    if not TRAIN_MODE:
+        if not os.path.exists(MODEL_PATH):
+            raise FileNotFoundError(
+                f"Missing graph residual model: {MODEL_PATH}. "
+                "Set TRAIN_MODE=True to train it first."
+            )
+
+        test_ds = ResidualSnapshotDataset(X_mm, Y_mm, test_t, base_test, feature_cols, scaler, local_cols, global_cols, static_cols)
+        test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+
+        print("\n--- Test only for saved OOF hybrid model ---")
+        model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+        _, clean_test_metrics = eval_hybrid(model, test_loader, A_s, A_f, "TEST", return_metrics=True)
+
+        if RUN_NOISE_ROBUSTNESS:
+            run_noise_robustness(
+                model,
+                xgb_d,
+                xgb_p,
+                X_mm,
+                Y_mm,
+                test_t,
+                feature_cols,
+                scaler,
+                local_cols,
+                global_cols,
+                static_cols,
+                A_s,
+                A_f,
+                clean_base_metrics,
+                clean_test_metrics,
+            )
+        return
 
     base_val = predict_base_for_contiguous_split(xgb_d, xgb_p, X_mm, val_t)
-    base_test = predict_base_for_contiguous_split(xgb_d, xgb_p, X_mm, test_t)
     eval_xgb_base(base_val, Y_mm, val_t, "VAL")
-    eval_xgb_base(base_test, Y_mm, test_t, "TEST")
 
     # 2) Time-based OOF base predictions for residual training only
     oof_train_t, base_oof_train = make_time_based_oof_predictions(X_mm, Y_mm, train_t)
@@ -595,16 +968,6 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
     test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
-
-    A_s, A_f = load_graphs()
-    model = XGBGraphResidualNet(
-        num_nodes=NUM_NODES,
-        local_dim=len(local_cols),
-        global_dim=len(global_cols),
-        static_dim=len(static_cols),
-        hidden_dim=HIDDEN,
-        depth=DEPTH,
-    ).to(DEVICE)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2)
@@ -652,7 +1015,26 @@ def main():
 
     print("\n--- Final test for OOF hybrid model ---")
     model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
-    eval_hybrid(model, test_loader, A_s, A_f, "TEST")
+    _, clean_test_metrics = eval_hybrid(model, test_loader, A_s, A_f, "TEST", return_metrics=True)
+
+    if RUN_NOISE_ROBUSTNESS:
+        run_noise_robustness(
+            model,
+            xgb_d,
+            xgb_p,
+            X_mm,
+            Y_mm,
+            test_t,
+            feature_cols,
+            scaler,
+            local_cols,
+            global_cols,
+            static_cols,
+                A_s,
+                A_f,
+                clean_base_metrics,
+                clean_test_metrics,
+            )
 
 
 if __name__ == "__main__":
